@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2016-2017, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2016-2018, The Linux Foundation. All rights reserved.
  * Copyright (C) 2013 Red Hat
  * Author: Rob Clark <robdclark@gmail.com>
  *
@@ -1215,6 +1215,9 @@ static int _sde_hdmi_gpio_config(struct hdmi *hdmi, bool on)
 
 		gpio_free(config->hpd_gpio);
 
+		if (config->hpd5v_gpio != -1)
+			gpio_free(config->hpd5v_gpio);
+
 		if (config->mux_en_gpio != -1) {
 			gpio_set_value_cansleep(config->mux_en_gpio, 0);
 			gpio_free(config->mux_en_gpio);
@@ -1336,18 +1339,25 @@ static int _sde_hdmi_hpd_enable(struct sde_hdmi *sde_hdmi)
 			HDMI_HPD_CTRL_ENABLE | hpd_ctrl);
 	spin_unlock_irqrestore(&hdmi->reg_lock, flags);
 
+	hdmi->hpd_off = false;
+	SDE_DEBUG("enabled hdmi hpd\n");
 	return 0;
 
 fail:
 	return ret;
 }
 
-static void _sde_hdmi_hdp_disable(struct sde_hdmi *sde_hdmi)
+static void _sde_hdmi_hpd_disable(struct sde_hdmi *sde_hdmi)
 {
 	struct hdmi *hdmi = sde_hdmi->ctrl.ctrl;
 	const struct hdmi_platform_config *config = hdmi->config;
 	struct device *dev = &hdmi->pdev->dev;
 	int i, ret = 0;
+
+	if (hdmi->hpd_off) {
+		pr_warn("hdmi display hpd was already disabled\n");
+		return;
+	}
 
 	/* Disable HPD interrupt */
 	hdmi_write(hdmi, REG_HDMI_HPD_INT_CTRL, 0);
@@ -1371,6 +1381,36 @@ static void _sde_hdmi_hdp_disable(struct sde_hdmi *sde_hdmi)
 			pr_warn("failed to disable hpd regulator: %s (%d)\n",
 					config->hpd_reg_names[i], ret);
 	}
+	hdmi->hpd_off = true;
+	SDE_DEBUG("disabled hdmi hpd\n");
+}
+
+/**
+ * _sde_hdmi_update_hpd_state() - Update the HDMI HPD clock state
+ *
+ * @state: non-zero to disbale HPD clock, 0 to enable.
+ * return: 0 on success, non-zero in case of failure.
+ *
+ */
+static int
+_sde_hdmi_update_hpd_state(struct sde_hdmi *hdmi_display, u64 state)
+{
+	struct hdmi *hdmi = hdmi_display->ctrl.ctrl;
+	int rc = 0;
+
+	if (hdmi_display->non_pluggable)
+		return 0;
+
+	SDE_DEBUG("changing hdmi hpd state to %llu\n", state);
+
+	if (state == SDE_MODE_HPD_ON) {
+		if (!hdmi->hpd_off)
+			pr_warn("hdmi display hpd was already enabled\n");
+		rc = _sde_hdmi_hpd_enable(hdmi_display);
+	} else
+		_sde_hdmi_hpd_disable(hdmi_display);
+
+	return rc;
 }
 
 static void _sde_hdmi_cec_update_phys_addr(struct sde_hdmi *display)
@@ -1894,6 +1934,7 @@ struct drm_msm_ext_panel_hdr_metadata *hdr_meta)
 	u32 const version = 0x01;
 	u32 const length = 0x1a;
 	u32 const descriptor_id = 0x00;
+	u8 checksum;
 	struct hdmi *hdmi;
 	struct drm_connector *connector;
 
@@ -1910,11 +1951,33 @@ struct drm_msm_ext_panel_hdr_metadata *hdr_meta)
 		return;
 	}
 
+	/* Setup the line number to send the packet on */
+	packet_control = hdmi_read(hdmi, HDMI_GEN_PKT_CTRL);
+	packet_control |= BIT(16);
+	hdmi_write(hdmi, HDMI_GEN_PKT_CTRL, packet_control);
+
+	/* Setup the packet to be sent every frame */
+	packet_control = hdmi_read(hdmi, HDMI_GEN_PKT_CTRL);
+	packet_control |= BIT(1);
+	hdmi_write(hdmi, HDMI_GEN_PKT_CTRL, packet_control);
+
 	/* Setup Packet header and payload */
 	packet_header = type_code | (version << 8) | (length << 16);
 	hdmi_write(hdmi, HDMI_GENERIC0_HDR, packet_header);
 
-	packet_payload = (hdr_meta->eotf << 8);
+	/**
+	 * Checksum is not a mandatory field for
+	 * the HDR infoframe as per CEA-861-3 specification.
+	 * However some HDMI sinks still expect a
+	 * valid checksum to be included as part of
+	 * the infoframe. Hence compute and add
+	 * the checksum to improve sink interoperability
+	 * for our HDR solution on HDMI.
+	 */
+	checksum = sde_hdmi_hdr_set_chksum(hdr_meta);
+
+	packet_payload = (hdr_meta->eotf << 8) | checksum;
+
 	if (connector->hdr_metadata_type_one) {
 		packet_payload |= (descriptor_id << 16)
 			| (HDMI_GET_LSB(hdr_meta->display_primaries_x[0])
@@ -1968,14 +2031,20 @@ struct drm_msm_ext_panel_hdr_metadata *hdr_meta)
 	hdmi_write(hdmi, HDMI_GENERIC0_6, packet_payload);
 
 enable_packet_control:
-	/*
-	 * GENERIC0_LINE | GENERIC0_CONT | GENERIC0_SEND
-	 * Setup HDMI TX generic packet control
-	 * Enable this packet to transmit every frame
-	 * Enable HDMI TX engine to transmit Generic packet 1
-	 */
+
+	/* Flush the contents to the register */
 	packet_control = hdmi_read(hdmi, HDMI_GEN_PKT_CTRL);
-	packet_control |= BIT(0) | BIT(1) | BIT(2) | BIT(16);
+	packet_control |= BIT(2);
+	hdmi_write(hdmi, HDMI_GEN_PKT_CTRL, packet_control);
+
+	/* Clear the flush bit of the register */
+	packet_control = hdmi_read(hdmi, HDMI_GEN_PKT_CTRL);
+	packet_control &= ~BIT(2);
+	hdmi_write(hdmi, HDMI_GEN_PKT_CTRL, packet_control);
+
+	/* Start sending the packets*/
+	packet_control = hdmi_read(hdmi, HDMI_GEN_PKT_CTRL);
+	packet_control |= BIT(0);
 	hdmi_write(hdmi, HDMI_GEN_PKT_CTRL, packet_control);
 }
 
@@ -2140,6 +2209,8 @@ int sde_hdmi_set_property(struct drm_connector *connector,
 		rc = _sde_hdmi_enable_pll_update(display, value);
 	else if (property_index == CONNECTOR_PROP_PLL_DELTA)
 		rc = _sde_hdmi_update_pll_delta(display, value);
+	else if (property_index == CONNECTOR_PROP_HPD_OFF)
+		rc = _sde_hdmi_update_hpd_state(display, value);
 
 	return rc;
 }
@@ -2217,7 +2288,7 @@ int sde_hdmi_connector_pre_deinit(struct drm_connector *connector,
 		return -EINVAL;
 	}
 
-	_sde_hdmi_hdp_disable(sde_hdmi);
+	_sde_hdmi_hpd_disable(sde_hdmi);
 
 	return 0;
 }
@@ -2629,6 +2700,13 @@ enum drm_mode_status sde_hdmi_mode_valid(struct drm_connector *connector,
 
 	if (actual != requested)
 		return MODE_CLOCK_RANGE;
+
+	/* if no format flags are present remove the mode */
+	if (!(mode->flags & SDE_DRM_MODE_FLAG_FMT_MASK)) {
+		SDE_HDMI_DEBUG("removing following mode from list\n");
+		drm_mode_debug_printmodeline(mode);
+		return MODE_BAD;
+	}
 
 	return MODE_OK;
 }
